@@ -14,9 +14,9 @@ The patches move the requests into a subprocess (`ffi/util` `runInSubProcess`) a
 | Patch | Plugin | Covers | Still blocks |
 |---|---|---|---|
 | `2-hatelemetry-background-requests.lua` | [hatelemetry.koplugin](https://github.com/hudsonbrendon/hatelemetry.koplugin) v0.4.0 | every telemetry push (webhook and legacy REST); also keeps one periodic push loop across file manager/reader switches | "Test connection" in the menu |
-| `2-hatelemetry-push-on-change.lua` | hatelemetry.koplugin v0.4.0 | pushes when something changes (page turn after 4 s, otherwise a local check every 60 s: page, book, battery, charging, front light, Wi-Fi, highlights); the plugin's timer becomes a heartbeat | n/a |
+| `2-hatelemetry-push-on-change.lua` | hatelemetry.koplugin v0.4.0 | pushes when something changes, driven by KOReader events (page turn after 4 s, at most every 30 s while reading on; charging, front light, warmth, Wi-Fi, highlights) plus a battery read every 5 min; the plugin's timer becomes a heartbeat | n/a |
 | `2-hatelemetry-command-listener.lua` | hatelemetry.koplugin v0.4.0 | an authenticated command endpoint (`POST /command`, `POST /push`, `GET /state`, port 8081) running the plugin's own commands, so Home Assistant can send them instantly instead of waiting for the next push; replaces the HTTP Inspector for remote control | n/a |
-| `2-android-idle-sleep.lua` | KOReader on Android | sleeps after N idle minutes (`android_idle_sleep_minutes`, default 10) counting remote commands as activity; keep KOReader's own screen timeout on "keep screen on" | n/a |
+| `2-android-idle-sleep.lua` | KOReader on Android | sleeps after N idle minutes (`android_idle_sleep_minutes`, default 10; 5 here) counting remote commands as activity; keep KOReader's own screen timeout on "keep screen on" | n/a |
 | `2-cwngsync-background-requests.lua` | cwngsync.koplugin ([Calibre-Web NextGen](https://github.com/new-usemame/Calibre-Web-NextGen)) 4.1.48 to 4.1.56 | the JSON calls (progress, inventory, library manifest, annotations, deliveries, collections, pairing) and the sleep screen sync | book/placeholder downloads and the checksum after a download |
 
 Each patch turns itself off when the plugin already does this, so it can stay installed after
@@ -62,6 +62,16 @@ rest_command:
 `{"type": "set_frontlight", "value": 40}`, `{"type": "show_message", "text": "Hi"}`, ...) or
 `toggle_dark_mode` / `push_now`. Measured over Tailscale: 0.15 s per command. Each command also
 counts as activity for `2-android-idle-sleep.lua`.
+
+### Keep-alive and polling
+
+The listener keeps HTTP connections open between requests (one TCP handshake less per command;
+measured 14 ms per request on a kept-open connection). KOReader polls registered servers every
+50 ms (`UIManager.ZMQ_TIMEOUT`) for as long as one runs: ~1000 wakeups of the UI thread per 30 s
+of idle reading on the Boox. The patch polls every 250 ms when idle and 50 ms for 30 s after any
+input (120 wakeups per 30 s). With the KOReader change proposed upstream (`input_android`
+`addFd`, and UIManager watching a server's fd instead of polling it) the listener and the HTTP
+Inspector cost nothing while idle: 0 wakeups and 0 CPU per 30 s, commands drawn immediately.
 
 ## Idle sleep on Android
 

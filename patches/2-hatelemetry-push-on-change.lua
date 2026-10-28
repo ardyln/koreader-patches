@@ -8,7 +8,8 @@ a page turn and still gets identical snapshots while nothing happens.
 
 With this patch a push goes out when something changes, driven by KOReader's
 own events, without polling the snapshot:
-- page turn: PAGE_DEBOUNCE seconds after the last turn;
+- page turn: PAGE_DEBOUNCE seconds after the last turn, and while reading on
+  at most every PAGE_MIN_INTERVAL seconds;
 - charging/not charging, front light on/off, brightness, warmth, Wi-Fi
   connected, highlights/notes changed: EVENT_DEBOUNCE seconds after the event;
 - battery: its level alone is read every BATTERY_INTERVAL seconds (cheap).
@@ -30,6 +31,7 @@ local UIManager = require("ui/uimanager")
 local logger = require("logger")
 
 local PAGE_DEBOUNCE = 4       -- s after the last page turn
+local PAGE_MIN_INTERVAL = 30  -- s between page-driven pushes while reading continuously
 local EVENT_DEBOUNCE = 2      -- s after a charging/light/network/annotation event
 local BATTERY_INTERVAL = 300  -- s between battery level reads while awake
 
@@ -49,6 +51,7 @@ local state = {
     plugin = nil,   -- the current plugin instance
     last_sig = nil, -- signature of the last snapshot a push collected
     last_snap = nil, -- that snapshot's tracked fields, to log what changed
+    last_push_at = nil, -- os.time() of that collect
     battery_fn = nil, -- scheduled battery read
     check_fn = nil,   -- scheduled (debounced) change check
 }
@@ -91,6 +94,7 @@ local function patchPlugin(HATelemetry)
     HATelemetry.collect = function(self, reading_override)
         local snap = orig_collect(self, reading_override)
         state.last_sig, state.last_snap = tracked(snap)
+        state.last_push_at = os.time()
         return snap
     end
 
@@ -147,7 +151,10 @@ local function patchPlugin(HATelemetry)
 
     HATelemetry.onPageUpdate = function(self, pageno)
         local ret = orig_onPageUpdate(self, pageno)
-        checkSoon(PAGE_DEBOUNCE)
+        -- After a pause, a turn is sent PAGE_DEBOUNCE s later; while reading on, at most every PAGE_MIN_INTERVAL s.
+        local wait = PAGE_DEBOUNCE
+        if state.last_push_at then wait = math.max(wait, state.last_push_at + PAGE_MIN_INTERVAL - os.time()) end
+        checkSoon(wait)
         return ret
     end
 

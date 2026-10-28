@@ -20,8 +20,12 @@ page_turn, goto_page, goto_chapter, toggle_bookmark, set_dark_mode, refresh,
 show_message, set_wifi, sync_now, suspend, restart), run by the plugin's own
 commands.lua, plus two here: toggle_dark_mode and push_now.
 
-The listener costs nothing while idle: KOReader polls the socket in its event
-loop, as it does for the HTTP Inspector. It stops on suspend and restarts on
+Connections are kept open between requests (HTTP keep-alive), saving the TCP
+handshake on each command. KOReader polls the server in its event loop, like the
+HTTP Inspector, but every 250 ms when idle instead of every 50 ms (50 ms for 30 s
+after any input). On a KOReader whose input backend can watch file descriptors
+(Android, with the change proposed upstream) it isn't polled at all: KOReader
+wakes when a connection or request arrives. It stops on suspend and restarts on
 resume. A command counts as user activity: KOReader's own timers reset, and on
 Android the screen timeout restarts as if the screen had been touched.
 --]]--
@@ -38,8 +42,7 @@ local SETTINGS_KEY = "hatelemetry_listener"
 local state = {
     plugin = nil,    -- the current plugin instance
     Commands = nil,  -- the plugin's commands.lua
-    server = nil,    -- SimpleTCPServer while listening
-    queue = nil,     -- its UIManager ZMQ handle
+    server = nil,    -- Server while listening
 }
 
 local function settings()
@@ -75,15 +78,21 @@ end
 
 local REASONS = { [200] = "OK", [400] = "Bad Request", [401] = "Unauthorized", [404] = "Not Found", [503] = "Service Unavailable" }
 
-local function respond(client, code, body)
+-- The client's connection stays open (HTTP keep-alive), so the next command
+-- skips the TCP handshake: one Wi-Fi round trip less.
+local function respond(c, req, code, body)
     body = body or ""
-    state.server:send(table.concat({
+    local close = (req.headers["connection"] or ""):lower() == "close"
+    c.sock:settimeout(1)
+    c.sock:send(table.concat({
         "HTTP/1.1 " .. code .. " " .. (REASONS[code] or ""),
         "Content-Type: application/json",
         "Content-Length: " .. #body,
-        "Connection: close",
+        close and "Connection: close" or "Connection: keep-alive",
         "", body,
-    }, "\r\n"), client)
+    }, "\r\n"))
+    c.sock:settimeout(0)
+    if close then c.close = true end
 end
 
 local function runCommands(cmds)
@@ -104,54 +113,164 @@ local function runCommands(cmds)
     return applied
 end
 
-local function onRequest(data, client)
+local function onRequest(req, c)
     local rapidjson = require("rapidjson")
-    local method, path = data:match("^(%u+) ([^ ]+) HTTP/")
-    local headers = {}
-    for name, value in data:gmatch("\n([^:\r\n]+):%s*([^\r\n]*)") do headers[name:lower()] = value end
-
     local s = settings()
-    if not (s and headers["authorization"] == "Bearer " .. s.token) then
-        respond(client, 401, '{"ok":false,"error":"unauthorized"}')
+    if not (s and req.headers["authorization"] == "Bearer " .. s.token) then
+        respond(c, req, 401, '{"ok":false,"error":"unauthorized"}')
         return
     end
     if not state.plugin then
-        respond(client, 503, '{"ok":false,"error":"plugin not ready"}')
+        respond(c, req, 503, '{"ok":false,"error":"plugin not ready"}')
         return
     end
-    path = path and path:gsub("%?.*$", "")
+    local path = req.path and req.path:gsub("%?.*$", "")
 
-    if method == "GET" and path == "/state" then
+    if req.method == "GET" and path == "/state" then
         local ok, snap = pcall(state.plugin.collect, state.plugin, true)
-        respond(client, ok and 200 or 503, ok and rapidjson.encode(snap) or '{"ok":false}')
+        respond(c, req, ok and 200 or 503, ok and rapidjson.encode(snap) or '{"ok":false}')
         return
     end
-    if method == "POST" and path == "/push" then
+    if req.method == "POST" and path == "/push" then
         state.plugin:push(true)
-        respond(client, 200, '{"ok":true}')
+        respond(c, req, 200, '{"ok":true}')
         return
     end
-    if method == "POST" and path == "/command" then
-        local len = tonumber(headers["content-length"]) or 0
-        local body = len > 0 and len < 65536 and client:receive(len) or nil
-        local ok, decoded = pcall(rapidjson.decode, body or "")
+    if req.method == "POST" and path == "/command" then
+        local ok, decoded = pcall(rapidjson.decode, req.body)
         if not ok or type(decoded) ~= "table" then
-            respond(client, 400, '{"ok":false,"error":"body must be JSON"}')
+            respond(c, req, 400, '{"ok":false,"error":"body must be JSON"}')
             return
         end
         local cmds = decoded.commands or (decoded.type and { decoded }) or decoded
         local applied = runCommands(cmds)
-        respond(client, 200, rapidjson.encode({ ok = true, applied = applied }))
+        respond(c, req, 200, rapidjson.encode({ ok = true, applied = applied }))
         pokeScreenTimeout()
         -- Like a key press: resets KOReader's own standby/suspend timers.
         return Event:new("InputEvent")
     end
-    respond(client, 404, '{"ok":false,"error":"not found"}')
+    respond(c, req, 404, '{"ok":false,"error":"not found"}')
 end
 
+-- A small non-blocking HTTP/1.1 server with keep-alive. UIManager calls
+-- waitEvent() on every loop pass (it's registered like a ZMQ); one select()
+-- with no timeout covers the listening socket and every open connection.
+local KEEPALIVE_IDLE = 30 -- s an idle connection stays open
+local MAX_REQUEST = 65536 -- bytes
+
+local Server = {}
+Server.__index = Server
+
+function Server.new(host, port)
+    return setmetatable({ host = host, port = port, clients = {} }, Server)
+end
+
+function Server:start()
+    local listener, err = require("socket").bind(self.host, self.port)
+    if not listener then return false, err end
+    listener:settimeout(0)
+    self.listener = listener
+    return true
+end
+
+-- With a KOReader whose input backend can watch file descriptors (Input.input.addFd),
+-- UIManager registers getFd() and wakes up on new connections; open connections are
+-- registered here, so a request on one wakes it too. Without it, UIManager polls waitEvent().
+local backend = require("device").input.input
+
+function Server:getFd()
+    return self.listener and self.listener:getfd()
+end
+
+local function watch(c)
+    if backend.addFd and backend.addFd(c.sock:getfd()) then c.watched = true end
+end
+
+local function dropClient(self, c)
+    self.clients[c] = nil
+    if c.watched then backend.removeFd(c.sock:getfd()) end
+    pcall(c.sock.close, c.sock)
+end
+
+function Server:stop()
+    for c in pairs(self.clients) do dropClient(self, c) end
+    self.clients = {}
+    if self.listener then self.listener:close(); self.listener = nil end
+end
+
+-- The next complete request in the client's buffer, or nil.
+local function takeRequest(c)
+    local head_end = c.buf:find("\r\n\r\n", 1, true)
+    if not head_end then return nil end
+    local head = c.buf:sub(1, head_end - 1)
+    local headers = {}
+    for name, value in head:gmatch("\n([^:\r\n]+):%s*([^\r\n]*)") do headers[name:lower()] = value end
+    local len = tonumber(headers["content-length"]) or 0
+    if #c.buf < head_end + 3 + len then return nil end
+    local req = {
+        headers = headers,
+        body = c.buf:sub(head_end + 4, head_end + 3 + len),
+    }
+    req.method, req.path = head:match("^(%u+) ([^ ]+) HTTP/")
+    c.buf = c.buf:sub(head_end + 4 + len)
+    return req
+end
+
+-- UIManager keeps calling this until it returns nil.
+function Server:waitEvent()
+    if not self.listener then return end
+    local now = os.time()
+    local sock = self.listener:accept()
+    if sock then
+        sock:settimeout(0)
+        local c = { sock = sock, buf = "", last = now }
+        self.clients[c] = true
+        watch(c)
+    end
+    for c in pairs(self.clients) do
+        local data, err, partial = c.sock:receive(8192)
+        local got = data or partial
+        if got and #got > 0 then
+            c.buf = c.buf .. got
+            c.last = now
+        end
+        if err == "closed" or #c.buf > MAX_REQUEST then
+            dropClient(self, c)
+        else
+            local req = takeRequest(c)
+            if req then
+                local ok, ev = pcall(onRequest, req, c)
+                if not ok then
+                    logger.warn("[HATelemetry]: listener request failed:", ev)
+                    c.close = true
+                end
+                if c.close then dropClient(self, c) end
+                if ok and ev then return ev end
+            elseif now - c.last > KEEPALIVE_IDLE then
+                dropClient(self, c)
+            end
+        end
+    end
+end
+
+-- UIManager wakes every ZMQ_TIMEOUT to call waitEvent() while a server is registered.
+-- Poll fast for a while after any input (touch, key or command), slower when idle.
+local FAST_ZMQ_US = 50 * 1000
+local SLOW_ZMQ_US = 250 * 1000
+local FAST_WINDOW = 30 -- s
+local function slowPoll() UIManager.ZMQ_TIMEOUT = SLOW_ZMQ_US end
+UIManager.event_hook:register("InputEvent", function()
+    UIManager.ZMQ_TIMEOUT = FAST_ZMQ_US
+    UIManager:unschedule(slowPoll)
+    UIManager:scheduleIn(FAST_WINDOW, slowPoll)
+end)
+
 local function stop()
-    if state.queue then UIManager:removeZMQ(state.queue); state.queue = nil end
-    if state.server then pcall(state.server.stop, state.server); state.server = nil end
+    if state.server then
+        UIManager:removeZMQ(state.server)
+        pcall(state.server.stop, state.server)
+        state.server = nil
+    end
 end
 
 local function start()
@@ -161,27 +280,15 @@ local function start()
         logger.warn("[HATelemetry]: listener not started, no token")
         return
     end
-    local Server = require("ui/message/simpletcpserver")
-    local server = Server:new{
-        host = s.host,
-        port = s.port,
-        receiveCallback = function(data, client)
-            local ok, ev = pcall(onRequest, data, client)
-            if not ok then
-                logger.warn("[HATelemetry]: listener request failed:", ev)
-                pcall(client.close, client)
-                return
-            end
-            return ev
-        end,
-    }
+    local server = Server.new(s.host, s.port)
     local ok, err = server:start()
     if not ok then
         logger.warn("[HATelemetry]: listener could not start:", err)
         return
     end
     state.server = server
-    state.queue = UIManager:insertZMQ(server)
+    UIManager:insertZMQ(server)
+    slowPoll()
     logger.info("[HATelemetry]: listening for commands on", s.host .. ":" .. s.port)
 end
 
