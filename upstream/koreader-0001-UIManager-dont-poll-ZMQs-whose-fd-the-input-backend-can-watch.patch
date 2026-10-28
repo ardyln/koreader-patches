@@ -1,0 +1,148 @@
+From c8cb62ca0c43baca148b64a26b3125a228cd4d9a Mon Sep 17 00:00:00 2001
+From: ardyln <11132223+ardyln@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 14:46:04 +0300
+Subject: [PATCH] UIManager: don't poll ZMQs whose fd the input backend can
+ watch
+
+With a ZMQ registered (e.g., the HTTP inspector), UIManager caps every
+input wait at ZMQ_TIMEOUT, waking KOReader 20 times a second for as long
+as it runs. On a Boox Go Color 7 Gen 2 (Android 13) that was ~1000
+wakeups per 30 s of idle reading.
+
+If a ZMQ exposes getFd() and the input backend provides addFd() (Android,
+c.f. koreader-base input_android), register the fd instead, and only
+apply ZMQ_TIMEOUT to ZMQs that can't be watched. Input:waitEvent returns
+to UIManager on EAGAIN, which the backend reports for a readable fd.
+After processZMQs handles an event, return from input polling right away,
+so the repaint and any task the ZMQ scheduled (the inspector sends its
+events via nextTick) aren't left waiting for the next input.
+
+SimpleTCPServer exposes its listening socket's fd.
+
+Measured on the Boox: idle wakeups of the UI thread 1004 -> 0 per 30 s,
+CPU 140 ms -> 0; inspector GotoViewRel round trip 0.11-0.15 s, drawn
+immediately; taps and night mode unaffected.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ frontend/device/input.lua               |  6 ++++++
+ frontend/ui/message/simpletcpserver.lua |  5 +++++
+ frontend/ui/uimanager.lua               | 27 +++++++++++++++++++++----
+ 3 files changed, 34 insertions(+), 4 deletions(-)
+
+diff --git a/frontend/device/input.lua b/frontend/device/input.lua
+index 4bfc3e4..c4e733d 100644
+--- a/frontend/device/input.lua
++++ b/frontend/device/input.lua
+@@ -1594,6 +1594,7 @@ function Input:waitEvent(now, deadline)
+     --                          If the timerfd backend is in use, and the early return was caused by a timerfd expiring,
+     --                          it returns false, C.ETIME, timerfd; where timerfd is a C pointer (i.e., light userdata)
+     --                          to the timerfd node that expired (so as to be able to free it later, c.f., input/timerfd-callbacks.h).
++    --                          If a file descriptor registered via the backend's addFd became readable, errno is C.EAGAIN.
+     --                          Otherwise, errno is the actual error code from the backend (e.g., select's errno for the C backend).
+     -- * nil: When something terrible happened (e.g., fatal poll/read failure). We abort in such cases.
+     while true do
+@@ -1742,6 +1743,11 @@ function Input:waitEvent(now, deadline)
+                 -- Don't report an error on ETIME, and go back to UIManager
+                 ev = nil
+                 break
++            elseif ev == C.EAGAIN then
++                -- A file descriptor registered via the backend's addFd is ready (e.g., a client connecting to
++                -- a message queue server): go back to UIManager, which will process its ZMQs.
++                ev = nil
++                break
+             elseif ev == C.EINTR then  -- luacheck: ignore
+                 -- Retry on EINTR
+             else
+diff --git a/frontend/ui/message/simpletcpserver.lua b/frontend/ui/message/simpletcpserver.lua
+index 79660c7..ebc7ab8 100644
+--- a/frontend/ui/message/simpletcpserver.lua
++++ b/frontend/ui/message/simpletcpserver.lua
+@@ -39,6 +39,11 @@ function SimpleTCPServer:stop()
+     self.server:close()
+ end
+ 
++-- The listening socket's fd, so UIManager can wake up on incoming connections instead of polling.
++function SimpleTCPServer:getFd()
++    return self.server and self.server:getfd()
++end
++
+ function SimpleTCPServer:waitEvent()
+     local client = self.server:accept() -- wait for a client to connect
+     if client then
+diff --git a/frontend/ui/uimanager.lua b/frontend/ui/uimanager.lua
+index f3760a5..39bd186 100644
+--- a/frontend/ui/uimanager.lua
++++ b/frontend/ui/uimanager.lua
+@@ -773,6 +773,12 @@ dbg:guard(UIManager, 'setDirty',
+ 
+ function UIManager:insertZMQ(zeromq)
+     table.insert(self._zeromqs, zeromq)
++    -- If the queue exposes a file descriptor and the input backend can watch it, input polling wakes up
++    -- as soon as it's readable, so this queue doesn't need the ZMQ_TIMEOUT wakeups (c.f., handleInput).
++    local fd = zeromq.getFd and zeromq:getFd()
++    if fd and Input.input.addFd and Input.input.addFd(fd) then
++        zeromq._watched_fd = fd
++    end
+     return zeromq
+ end
+ 
+@@ -782,6 +788,10 @@ function UIManager:removeZMQ(zeromq)
+             table.remove(self._zeromqs, i)
+         end
+     end
++    if zeromq._watched_fd then
++        Input.input.removeFd(zeromq._watched_fd)
++        zeromq._watched_fd = nil
++    end
+ end
+ 
+ --[[--
+@@ -1521,6 +1531,7 @@ function UIManager:handleInputEvent(input_event)
+ end
+ 
+ -- Process all pending events on all registered ZMQs.
++-- Returns true if any of them produced an event.
+ function UIManager:processZMQs()
+     local sent_InputEvent = false
+     for _, zeromq in ipairs(self._zeromqs) do
+@@ -1532,6 +1543,7 @@ function UIManager:processZMQs()
+             self:handleInputEvent(input_event)
+         end
+     end
++    return sent_InputEvent
+ end
+ 
+ function UIManager:handleInput()
+@@ -1573,9 +1585,12 @@ function UIManager:handleInput()
+     -- Default to INPUT_TIMEOUT (which may be nil, i.e. block until an event happens).
+     local wait_us = self.INPUT_TIMEOUT
+ 
+-    -- If we have any ZMQs registered, ZMQ_TIMEOUT is another upper bound.
+-    if self._zeromqs[1] then
+-        wait_us = math.min(wait_us or math.huge, self.ZMQ_TIMEOUT)
++    -- If we have any ZMQs registered that input polling can't watch, ZMQ_TIMEOUT is another upper bound.
++    for _, zeromq in ipairs(self._zeromqs) do
++        if not zeromq._watched_fd then
++            wait_us = math.min(wait_us or math.huge, self.ZMQ_TIMEOUT)
++            break
++        end
+     end
+ 
+     -- We pass that on as an absolute deadline, not a relative wait time.
+@@ -1591,7 +1606,11 @@ function UIManager:handleInput()
+     end
+ 
+     -- Run ZMQs if any
+-    self:processZMQs()
++    if self:processZMQs() then
++        -- Come straight back to repaint and to run whatever they scheduled:
++        -- a ZMQ whose fd input polling watches (c.f., insertZMQ) won't wake us up on a timer.
++        deadline = now
++    end
+ 
+     -- If allowed, entering standby (from which we can wake by input) must trigger in response to event
+     -- this function emits (plugin), or within waitEvent() right after (hardware).
+-- 
+2.55.0
+

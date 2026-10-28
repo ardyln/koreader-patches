@@ -1,0 +1,68 @@
+From 2fbbba1b65a3141815900006410ef0c0439812e9 Mon Sep 17 00:00:00 2001
+From: ardyln <11132223+ardyln@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 14:46:04 +0300
+Subject: [PATCH] input_android: wake waitForEvent on registered fds
+
+Add input.addFd/input.removeFd, which register a file descriptor with the
+app's ALooper under a new ident. When one becomes readable, waitForEvent
+returns false, EAGAIN, so Input:waitEvent hands control back to UIManager
+instead of polling again.
+
+This lets UIManager service a message queue server (e.g., the HTTP
+inspector's SimpleTCPServer) when a client connects, instead of waking up
+every ZMQ_TIMEOUT (50 ms) for as long as one is registered.
+
+EAGAIN rather than ETIME: Input:waitEvent treats ETIME as "a gesture timer
+may have expired" and could fire one early.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ffi/input_android.lua | 25 +++++++++++++++++++++++++
+ 1 file changed, 25 insertions(+)
+
+diff --git a/ffi/input_android.lua b/ffi/input_android.lua
+index 6dcae51..aca290b 100644
+--- a/ffi/input_android.lua
++++ b/ffi/input_android.lua
+@@ -20,6 +20,27 @@ local input = {
+ 
+ local inputQueue = {}
+ 
++-- Looper ident for file descriptors registered through input.addFd (e.g., the listening socket of a
++-- message queue server). Must not clash with the glue's LOOPER_ID_MAIN, LOOPER_ID_INPUT & LOOPER_ID_USER.
++local LOOPER_ID_FD = C.LOOPER_ID_USER + 1
++pcall(ffi.cdef, [[
++int ALooper_addFd(ALooper* looper, int fd, int ident, int events, ALooper_callbackFunc callback, void* data);
++int ALooper_removeFd(ALooper* looper, int fd);
++]])
++
++--- Wake input.waitForEvent when fd becomes readable.
++-- Lets UIManager service a message queue server (e.g., SimpleTCPServer) as soon as a client connects,
++-- instead of polling it on a timer.
++-- Returns true on success.
++function input.addFd(fd)
++    return android.lib.ALooper_addFd(android.app.looper, fd, LOOPER_ID_FD, C.ALOOPER_EVENT_INPUT, nil, nil) == 1
++end
++
++--- Stop watching an fd registered with input.addFd.
++function input.removeFd(fd)
++    android.lib.ALooper_removeFd(android.app.looper, fd)
++end
++
+ local function genInputTimeval(ts)
+     local timev = { sec = 0, usec = 0 }
+     if ts then
+@@ -291,6 +312,10 @@ function input.waitForEvent(sec, usec)
+                     android.lib.AInputQueue_finishEvent(android.app.inputQueue, event[0], handled)
+                 end
+             end
++        elseif poll_state == LOOPER_ID_FD then
++            -- A registered fd is readable: return to UIManager, which processes its message queues on every iteration.
++            -- EAGAIN, not ETIME: Input:waitEvent takes ETIME as "a gesture timer may have expired".
++            return false, C.EAGAIN
+         elseif poll_state == C.LOOPER_ID_USER then
+             local message = ffi.new("unsigned char [4]")
+             -- Similarly, read will return -1 (EAGAIN) when we've drained the pipe
+-- 
+2.55.0
+

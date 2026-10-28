@@ -1,7 +1,13 @@
-# KOReader user patches: background network requests
+# KOReader user patches: background requests, push on change, remote commands, idle sleep
 
-Two [KOReader user patches](https://koreader.rocks/user_guide/#L2-userpatches) that stop
-sync plugins from freezing KOReader while they wait on the network.
+[KOReader user patches](https://koreader.rocks/user_guide/#L2-userpatches) for a KOReader that
+talks to Home Assistant and Calibre-Web NextGen: plugin network requests off the UI thread (no
+more ANRs), telemetry pushed when something changes, an authenticated command endpoint instead of
+the HTTP Inspector, and sleep after idle on Android even when reading with a remote.
+
+**[WRITEUP.md](WRITEUP.md)** explains what was wrong, what each patch does and how it was
+measured. Written with the help of Claude (Anthropic) and tested on the author's Boox Go Color 7
+Gen 2; nothing here has been submitted to the plugins' or KOReader's repositories.
 
 Both plugins below send HTTP requests on KOReader's UI thread. While a request waits, KOReader
 can't handle touches, and on Android a wait over 5 s while you touch the screen ends in an ANR
@@ -101,5 +107,13 @@ them back when the URL is restored.
 
 ## Upstream
 
-These are stopgaps. `upstream/` holds the change proposed to hatelemetry itself; once the plugins
-fix this themselves, delete the matching patch.
+These are stopgaps: once a plugin does this itself, its patch switches off, and it can be deleted.
+
+`upstream/` holds a change to KOReader itself (koreader-base and koreader, one commit each, against
+their `master` of 2026-10-27): UIManager wakes on a server's socket instead of polling it every
+50 ms, on Android. See [WRITEUP.md](WRITEUP.md#7-the-event-loop-that-never-slept). It isn't a pull
+request; it's here for reference.
+
+## License
+
+AGPL-3.0-or-later, like KOReader.
